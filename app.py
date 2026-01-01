@@ -990,11 +990,11 @@ st.write("")
 st.sidebar.markdown("### Settings")
 
 def _load_initial_cash_default() -> float:
-    saved = get_setting(CONN, "initial_cash", "30000.0")
+    saved = get_setting(CONN, "initial_cash", "29862.53")
     try:
         return float(saved)
     except Exception:
-        return 30000.0
+        return 29862.53
 
 if "initial_cash_value" not in st.session_state:
     st.session_state["initial_cash_value"] = _load_initial_cash_default()
@@ -1540,4 +1540,5 @@ with tab_ana:
                 unsafe_allow_html=True
             )
 ```
+
 
