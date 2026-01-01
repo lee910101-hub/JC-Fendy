@@ -1,32 +1,15 @@
+```python
 # app.py
 # Portfolio Management App (Streamlit)
 #
-# Updates included in this version:
-# 1) Initial portfolio value = 30,000 USD as CASH.
-#    - Unused capital stays as cash
-#    - Buys reduce cash, sells increase cash
-#    - Portfolio value = cash + market value of holdings
-#
-# 2) Portfolio Analysis:
-#    - Portfolio Value (USD) over time
-#    - Indexed comparison vs SPY
-#    - Optional data labels (end-point labels) on charts
-#    - Top / Worst performers by Total PnL within selected window
-#      (Total PnL = Realized PnL within window + (Unrealized_end - Unrealized_start))
-#    - Switch for PnL cost-basis methods: FIFO / LIFO / Average Cost
-#
-# Other features:
-# ✅ SQLite persistence (portfolio.db)
-# ✅ Manual trade input (DATE only)
-# ✅ Paste import (BUY/SELL) from tab-separated tables
-# ✅ Positions tab (yfinance) + color-coded P&L + includes CASH row
-# ✅ Trade Log:
-#    - Excel Download
-#    - Excel Upload actions:
-#       - Replace DB with Excel (source of truth)
-#       - Append Excel rows (insert)
-#       - Update existing by ID (optional)
-#    - In-app edit + delete
+# Included improvements:
+# 1) Initial cash (USD) persists across app restarts (saved in SQLite settings table)
+# 2) Portfolio Analysis charts:
+#    - Portfolio value (USD) over time + optional end-point data labels
+#    - Indexed comparison vs SPY + optional end-point data labels
+# 3) Portfolio Analysis performer table (Top 3 / Worst 3) within selected window:
+#    - Total PnL = Realized PnL within window + (Unrealized_end - Unrealized_start)
+# 4) PnL method switch: FIFO / LIFO / AVG (Average Cost) for performer table
 #
 # Run:
 #   python -m pip install streamlit yfinance pandas numpy plotly openpyxl
@@ -172,6 +155,34 @@ def get_conn():
     return conn
 
 CONN = get_conn()
+
+def init_settings_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+def get_setting(conn, key: str, default=None):
+    cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    if row is None:
+        return default
+    return row[0]
+
+def set_setting(conn, key: str, value):
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+    conn.commit()
+
+init_settings_table(CONN)
 
 def read_trades() -> pd.DataFrame:
     df = pd.read_sql_query("SELECT * FROM trades ORDER BY dt ASC, id ASC", CONN)
@@ -431,7 +442,12 @@ def fetch_snapshot(ticker: str) -> dict:
         else:
             chg = (float(last) / float(prev) - 1.0) * 100.0
 
-        return {"name": name, "last": float(last), "prev_close": float(prev) if prev is not None else np.nan, "change_pct": float(chg)}
+        return {
+            "name": name,
+            "last": float(last),
+            "prev_close": float(prev) if prev is not None else np.nan,
+            "change_pct": float(chg),
+        }
     except Exception:
         return {"name": ticker, "last": np.nan, "prev_close": np.nan, "change_pct": np.nan}
 
@@ -541,8 +557,7 @@ def portfolio_value_series(trades: pd.DataFrame, initial_cash: float) -> pd.Seri
     Total portfolio value = cash + holdings value
     """
     if trades.empty:
-        s = pd.Series([initial_cash], index=[pd.to_datetime(date.today())], name="Portfolio")
-        return s
+        return pd.Series([initial_cash], index=[pd.to_datetime(date.today())], name="Portfolio")
 
     cash = cash_series(trades, initial_cash)
     hv = holdings_value_series(trades)
@@ -575,10 +590,10 @@ def _price_on_or_before(px: pd.Series, d: date) -> float:
     return float(s.iloc[-1]) if not s.empty else np.nan
 
 @st.cache_data(ttl=1800)
-def fetch_prices_window(tickers: list[str], start_d: date, end_d: date) -> pd.DataFrame:
+def fetch_prices_window(tickers: list, start_d: date, end_d: date) -> pd.DataFrame:
     """
     Fetch prices with a small lookback so start price can be "on or before" start_d.
-    end passed to yfinance is exclusive, so use end_d+1.
+    yfinance end is exclusive, so use end_d+1.
     """
     if not tickers:
         return pd.DataFrame()
@@ -596,9 +611,10 @@ def compute_performance_by_ticker(
     """
     Returns per-ticker performance within [start_d, end_d]:
       Realized PnL within window
-      Unrealized PnL change within window (Unreal_end - Unreal_start)
+      Unrealized change within window (Unreal_end - Unreal_start)
       Total PnL = Realized + Unrealized change
-    Cost basis methods: FIFO / LIFO / AVG
+
+    Cost basis methods: FIFO / LIFO / AVG (Average cost)
     """
     if trades.empty:
         return pd.DataFrame(columns=[
@@ -620,7 +636,6 @@ def compute_performance_by_ticker(
     if prices is None:
         prices = fetch_prices_window(tickers, start_d, end_d)
 
-    # price series per ticker
     px_map = {}
     for tk in tickers:
         if isinstance(prices, pd.DataFrame) and tk in prices.columns:
@@ -628,11 +643,9 @@ def compute_performance_by_ticker(
         else:
             px_map[tk] = pd.Series(dtype=float)
 
-    # Separate trades
     pre = df[df["date"] < start_d]
     win = df[(df["date"] >= start_d) & (df["date"] <= end_d)]
 
-    # State per ticker
     state = {}
     for tk in tickers:
         state[tk] = {
@@ -678,9 +691,7 @@ def compute_performance_by_ticker(
                     lots.pop(i)
                 else:
                     lots[i][0] = lot_qty
-
-            # If selling more than held, ignore extra (or treat as 0 PnL)
-            # (You can change this to allow shorts if needed.)
+            # If selling more than held, extra is ignored (no shorts in this model)
         else:
             sh = state[tk]["avg_shares"]
             ac = state[tk]["avg_cost"]
@@ -709,7 +720,7 @@ def compute_performance_by_ticker(
             unreal = sh * (price_for_unreal - ac)
             return sh, float(unreal)
 
-    # 1) Build starting inventory as-of start_d (apply pre-window trades)
+    # 1) Build inventory as-of start_d (apply pre-window trades)
     for _, r in pre.iterrows():
         tk = r["ticker"]
         qty = float(r["amount"])
@@ -719,14 +730,14 @@ def compute_performance_by_ticker(
         else:
             apply_sell(tk, qty, px)
 
-    # 2) Compute unreal_start and start_shares using start price
+    # 2) Start snapshot
     for tk in tickers:
         p0 = _price_on_or_before(px_map[tk], start_d)
         sh0, u0 = current_shares_and_unreal(tk, p0)
         state[tk]["start_shares"] = sh0
         state[tk]["unreal_start"] = u0
 
-    # 3) Apply in-window trades
+    # 3) Apply in-window trades (realized happens here)
     for _, r in win.iterrows():
         tk = r["ticker"]
         qty = float(r["amount"])
@@ -736,7 +747,7 @@ def compute_performance_by_ticker(
         else:
             apply_sell(tk, qty, px)
 
-    # 4) Compute unreal_end, end_shares, end MV using end price
+    # 4) End snapshot + assemble
     rows = []
     for tk in tickers:
         p0 = _price_on_or_before(px_map[tk], start_d)
@@ -753,7 +764,6 @@ def compute_performance_by_ticker(
         total = realized + unreal_delta if np.isfinite(unreal_delta) else np.nan
         end_mv = (sh1 * p1) if (np.isfinite(p1)) else np.nan
 
-        # Only include names that have activity/holdings relevant to the window
         has_any = (
             (state[tk]["start_shares"] > 1e-12) or
             (state[tk]["end_shares"] > 1e-12) or
@@ -791,7 +801,7 @@ def compute_positions(trades: pd.DataFrame, initial_cash: float) -> pd.DataFrame
         "Total unrealized P&L", "Total unrealized P&L (%)", "Average cost", "% in portfolio"
     ]
     if trades.empty:
-        pos = pd.DataFrame([{
+        return pd.DataFrame([{
             "Ticker": "CASH",
             "Stock name": "Cash (USD)",
             "Today's change (%)": 0.0,
@@ -802,14 +812,13 @@ def compute_positions(trades: pd.DataFrame, initial_cash: float) -> pd.DataFrame
             "Average cost": np.nan,
             "% in portfolio": 100.0,
         }], columns=cols)
-        return pos
 
     df = trades.copy()
     df["ticker"] = df["ticker"].str.upper()
     df["signed_qty"] = np.where(df["side"] == "BUY", df["amount"].astype(float), -df["amount"].astype(float))
     df = df.sort_values(["ticker", "dt", "id"])
 
-    # Moving average cost per ticker (simple, for Positions tab display only)
+    # Positions tab still uses simple moving average for display (separate from performer table method)
     state = {}
     for _, r in df.iterrows():
         tk = r["ticker"]
@@ -821,12 +830,12 @@ def compute_positions(trades: pd.DataFrame, initial_cash: float) -> pd.DataFrame
         s = state[tk]["shares"]
         ac = state[tk]["avg_cost"]
 
-        if qty > 0:  # buy
+        if qty > 0:
             new_shares = s + qty
             new_avg = (s * ac + qty * px) / new_shares if new_shares else 0.0
             state[tk]["shares"] = new_shares
             state[tk]["avg_cost"] = new_avg
-        else:  # sell
+        else:
             state[tk]["shares"] = s + qty
             if abs(state[tk]["shares"]) < 1e-9:
                 state[tk]["shares"] = 0.0
@@ -859,7 +868,6 @@ def compute_positions(trades: pd.DataFrame, initial_cash: float) -> pd.DataFrame
 
     pos = pd.DataFrame(rows)
 
-    # cash row
     cash_now = cash_series(trades, initial_cash).iloc[-1]
     cash_row = {
         "Ticker": "CASH",
@@ -882,8 +890,7 @@ def compute_positions(trades: pd.DataFrame, initial_cash: float) -> pd.DataFrame
     pos["% in portfolio"] = (pos["_mv"] / total_mv * 100.0) if total_mv and np.isfinite(total_mv) else np.nan
     pos = pos.drop(columns=["_mv"]).sort_values("% in portfolio", ascending=False).reset_index(drop=True)
 
-    pos = pos[cols]
-    return pos
+    return pos[cols]
 
 
 # =============================
@@ -901,7 +908,7 @@ def _parse_date_with_default_year(x, default_year: int) -> date:
     s = str(x).strip()
     if not s:
         return None
-    if "/" in s and len(s.split("/")) == 2:  # M/D missing year
+    if "/" in s and len(s.split("/")) == 2:
         s = f"{s}/{default_year}"
     dt = pd.to_datetime(s, format="mixed", errors="coerce")
     return None if pd.isna(dt) else dt.date()
@@ -978,17 +985,35 @@ st.write("")
 
 
 # =============================
-# Sidebar — Settings
+# Sidebar — Settings (persisted)
 # =============================
 st.sidebar.markdown("### Settings")
+
+def _load_initial_cash_default() -> float:
+    saved = get_setting(CONN, "initial_cash", "30000.0")
+    try:
+        return float(saved)
+    except Exception:
+        return 30000.0
+
+if "initial_cash_value" not in st.session_state:
+    st.session_state["initial_cash_value"] = _load_initial_cash_default()
+
+def _on_initial_cash_change():
+    val = float(st.session_state["initial_cash_value"])
+    set_setting(CONN, "initial_cash", val)
+
 initial_cash = st.sidebar.number_input(
     "Initial cash (USD)",
     min_value=0.0,
-    value=30000.0,
+    value=float(st.session_state["initial_cash_value"]),
     step=1000.0,
     format="%.2f",
+    key="initial_cash_value",
+    on_change=_on_initial_cash_change,
 )
-st.sidebar.markdown("<div class='small-note'>Cash is tracked automatically: buys reduce cash, sells increase cash.</div>", unsafe_allow_html=True)
+
+st.sidebar.markdown("<div class='small-note'>This value is saved in your portfolio.db and will persist after restart.</div>", unsafe_allow_html=True)
 
 st.sidebar.divider()
 
@@ -1061,7 +1086,6 @@ trades_df = read_trades()
 with tab_pos:
     pos = compute_positions(trades_df, initial_cash)
 
-    # KPIs
     if not pos.empty:
         cash_now = float(pos.loc[pos["Ticker"] == "CASH", "Amount held"].iloc[0]) if (pos["Ticker"] == "CASH").any() else 0.0
         holdings_mv = float((pos[pos["Ticker"] != "CASH"]["Latest price"] * pos[pos["Ticker"] != "CASH"]["Amount held"]).sum(skipna=True)) if (pos["Ticker"] != "CASH").any() else 0.0
@@ -1100,7 +1124,6 @@ with tab_pos:
 # =============================
 with tab_log:
     st.markdown("#### Trade Log")
-
     trades_df = read_trades()
 
     st.markdown("#### Excel: Replace / Append / Update")
@@ -1144,19 +1167,19 @@ with tab_log:
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                if st.button("Replace DB with Excel", use_container_width=True):
+                if st.button("Replace DB with Excel", use_container_width=True, key="btn_replace_excel"):
                     n = replace_db_with_excel(uploaded_df)
                     st.success(f"Replaced DB. Inserted {n} trade(s).")
                     st.cache_data.clear()
                     st.rerun()
             with c2:
-                if st.button("Append Excel rows (insert)", use_container_width=True):
+                if st.button("Append Excel rows (insert)", use_container_width=True, key="btn_append_excel"):
                     n = append_excel_to_db(uploaded_df, skip_duplicates=True)
                     st.success(f"Inserted {n} new trade(s).")
                     st.cache_data.clear()
                     st.rerun()
             with c3:
-                if st.button("Update existing by ID", use_container_width=True):
+                if st.button("Update existing by ID", use_container_width=True, key="btn_update_excel"):
                     n = update_existing_by_id(uploaded_df)
                     st.success(f"Updated {n} row(s) by ID.")
                     st.cache_data.clear()
@@ -1167,7 +1190,6 @@ with tab_log:
 
     st.divider()
 
-    # In-app editor
     trades_df = read_trades()
     if trades_df.empty:
         st.info("No trades in database yet.")
@@ -1200,7 +1222,7 @@ with tab_log:
 
         csave, cdel = st.columns([1, 2])
         with csave:
-            if st.button("Save edits"):
+            if st.button("Save edits", key="btn_save_edits"):
                 to_save = edited.rename(columns={
                     "ID": "id",
                     "Date": "date",
@@ -1224,7 +1246,7 @@ with tab_log:
         with cdel:
             ids = edited["ID"].tolist()
             sel = st.multiselect("Select trades to delete (by ID)", options=ids)
-            if st.button("Delete selected", type="secondary"):
+            if st.button("Delete selected", type="secondary", key="btn_delete_selected"):
                 delete_trade_ids(sel)
                 st.success(f"Deleted {len(sel)} trade(s).")
                 st.cache_data.clear()
@@ -1240,10 +1262,14 @@ with tab_ana:
     trades_df = read_trades()
 
     # Controls
-    cctl1, cctl2, cctl3 = st.columns([2, 2, 6], vertical_alignment="center")
+    cctl1, cctl2, _ = st.columns([2, 2, 6], vertical_alignment="center")
     with cctl1:
-        pnl_method = st.selectbox("PnL method", ["FIFO", "LIFO", "AVG"], index=0,
-                                  help="Used for the Top/Worst performer table (realized/unrealized change within window).")
+        pnl_method = st.selectbox(
+            "PnL method (for Top/Worst table)",
+            ["FIFO", "LIFO", "AVG"],
+            index=0,
+            help="Used to compute realized PnL from sells + unrealized change within the selected window."
+        )
     with cctl2:
         show_labels = st.checkbox("Show data labels (end points)", value=True)
 
@@ -1298,7 +1324,7 @@ with tab_ana:
                 st.warning("Not enough data in the selected window to compute performance.")
                 st.stop()
 
-            # --- KPIs
+            # KPIs
             win_return = (pv.iloc[-1] / pv.iloc[0] - 1.0) * 100.0
 
             def compute_period_returns(value: pd.Series) -> dict:
@@ -1337,7 +1363,7 @@ with tab_ana:
 
             st.write("")
 
-            # --- Chart 1: Portfolio value (USD)
+            # Chart 1: Portfolio value (USD)
             fig_val = go.Figure()
             fig_val.add_trace(go.Scatter(
                 x=pv.index, y=pv.values, mode="lines",
@@ -1358,7 +1384,6 @@ with tab_ana:
                 ))
 
             if show_labels:
-                # Label only the last point (avoid clutter)
                 fig_val.add_trace(go.Scatter(
                     x=[pv.index[-1]], y=[pv.values[-1]],
                     mode="markers+text",
@@ -1392,7 +1417,7 @@ with tab_ana:
             )
             st.plotly_chart(fig_val, use_container_width=True)
 
-            # --- Chart 2: Indexed comparison vs SPY
+            # Chart 2: Indexed comparison vs SPY
             spy_px = fetch_history(["SPY"], start=start_d, end=end_d + timedelta(days=1))
             spy = spy_px["SPY"].copy() if isinstance(spy_px, pd.DataFrame) and "SPY" in spy_px.columns else pd.Series(dtype=float)
             if not spy.empty:
@@ -1445,8 +1470,9 @@ with tab_ana:
             )
             st.plotly_chart(fig_idx, use_container_width=True)
 
-            # --- Top / Worst performers by Total PnL (within window)
+            # Top / Worst performers
             st.markdown("#### Top / Worst Performers (within selected window)")
+
             tickers = sorted(trades_df["ticker"].astype(str).str.upper().unique().tolist())
             prices_window = fetch_prices_window(tickers, start_d, end_d)
 
@@ -1466,10 +1492,6 @@ with tab_ana:
 
                 def fmt_perf(df_):
                     df_ = df_.copy()
-                    df_["Realized PnL"] = df_["Realized PnL"].map(lambda x: np.nan if pd.isna(x) else float(x))
-                    df_["Unrealized Δ"] = df_["Unrealized Δ"].map(lambda x: np.nan if pd.isna(x) else float(x))
-                    df_["Total PnL"] = df_["Total PnL"].map(lambda x: np.nan if pd.isna(x) else float(x))
-                    df_["End MV"] = df_["End MV"].map(lambda x: np.nan if pd.isna(x) else float(x))
                     return df_[["Ticker", "Realized PnL", "Unrealized Δ", "Total PnL", "Start Shares", "End Shares", "End MV"]]
 
                 cA, cB = st.columns(2)
@@ -1514,11 +1536,8 @@ with tab_ana:
                     )
 
             st.markdown(
-                "<div class='small-note'>Notes: Performer table uses your selected PnL method (FIFO/LIFO/AVG) to compute realized PnL from sells within the window, and unrealized change as (unrealized at end price) − (unrealized at start price) based on inventory held at those times. This is ticker-level attribution, not a perfect cashflow attribution model.</div>",
+                "<div class='small-note'>Notes: Initial cash is persisted to SQLite (settings table). Performer table uses FIFO/LIFO/AVG cost basis for realized PnL from sells inside the window, and unrealized change computed from inventory value at start vs end prices.</div>",
                 unsafe_allow_html=True
             )
-            st.markdown(
-                "<div class='small-note'>Charts: data labels are end-point labels only to avoid clutter on dense time series.</div>",
-                unsafe_allow_html=True
-            )
+```
 
